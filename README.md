@@ -79,6 +79,78 @@ delta.modified # => entities present in both with changed field values
 delta.empty?   # => true when no differences exist (idempotent guard)
 ```
 
+## Architecture
+
+The diagram below covers every component in the system and the data flowing between them.
+Dashed arrows (`-.->`) denote interface implementation; solid arrows denote runtime data flow.
+
+```mermaid
+flowchart TD
+    subgraph setup["Setup Time"]
+        DSL["DSL: delta_core { }"]
+        Cfg["Configuration: snapshot_column"]
+        Map["Mapping: key · fields · strategy"]
+        DSL --> Cfg
+        Cfg --> Map
+        Map -->|nested relations| Map
+    end
+
+    Model(["AR Model Instance"])
+    setup -->|config stored on class| Model
+
+    Ctx["Context: calculate_delta · update_snapshot: build_state · reset_flags"]
+    Model --> Ctx
+
+    subgraph storage["Storage"]
+        AB["Adapters::Base: interface"]
+        AAR["Adapters::ActiveRecord: JSON column · with_lock"]
+        Snap["Snapshot: parse · serialize · empty?"]
+        DB[("PostgreSQL")]
+        AB -. implements .-> AAR
+        AAR <-->|load / persist| Snap
+        Snap <-->|read / write| DB
+    end
+
+    subgraph state["State Building"]
+        SB["StateBuilder: AR associations → plain Hash"]
+    end
+
+    subgraph comparison["Comparison"]
+        Cmp["Comparator: resolve strategy · merge results"]
+        SBase["Strategies::Base: interface"]
+        SQty["Strategies::Quantity"]
+        SRep["Strategies::Replace"]
+        SMrg["Strategies::Merge"]
+        Cmp -->|delegates to| SBase
+        SBase -. implements .-> SQty
+        SBase -. implements .-> SRep
+        SBase -. implements .-> SMrg
+    end
+
+    DR(["DeltaResult: added · removed · modified"])
+
+    Ctx -->|build current state| SB
+    Ctx -->|load · lock · persist| AAR
+    Map -->|mapping rules| SB
+    Map -->|mapping rules| Cmp
+    SB -->|current state Hash| Cmp
+    Snap -->|snapshot state Hash| Cmp
+    Cmp -->|merged output| DR
+```
+
+### Key flows
+
+**`calculate_delta`** — `Context` calls `StateBuilder` to produce a plain Hash of current
+associations, loads the persisted `Snapshot` via `Adapters::ActiveRecord`, then passes both into
+`Comparator`. For each `Mapping`, `Comparator` resolves the configured strategy
+(`Quantity` / `Replace` / `Merge`) via `Strategies::Base` and merges the results into a
+`DeltaResult`.
+
+**`update_snapshot`** — only called after external confirmation. `Context` acquires a record lock
+through `Adapters::ActiveRecord`, rebuilds current state via `StateBuilder`, serializes it through
+`Snapshot`, and persists the JSON back to the PostgreSQL column. The snapshot never advances if
+transmission fails.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to
